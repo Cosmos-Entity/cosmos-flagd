@@ -55,8 +55,9 @@ type Sync struct {
 	IncrementalUpdates      bool
 	Headers                 map[string]string
 
-	client FlagSyncServiceClient
-	ready  atomic.Bool
+	client            FlagSyncServiceClient
+	ready             atomic.Bool
+	disconnectedSince atomic.Pointer[time.Time]
 }
 
 func (g *Sync) Init(_ context.Context) error {
@@ -128,6 +129,9 @@ func (g *Sync) IsReady() bool {
 }
 
 func (g *Sync) Sync(ctx context.Context, dataSync chan<- sync.DataSync) error {
+	g.markDisconnected()
+	unregister := g.observeSyncState()
+	defer unregister()
 	g.Logger.Info(fmt.Sprintf("starting sync from %s", g.URI))
 
 	// Initialize SyncFlags client. This fails if server connection establishment fails (ex:- grpc server offline)
@@ -220,6 +224,7 @@ func (g *Sync) connectWithRetry(
 // handleFlagSync wraps the stream listening and push updates through dataSync channel
 func (g *Sync) handleFlagSync(stream syncv1grpc.FlagSyncService_SyncFlagsClient, dataSync chan<- sync.DataSync) error {
 	g.ready.Store(true)
+	defer g.markDisconnected()
 
 	for {
 		data, err := stream.Recv()
@@ -234,6 +239,9 @@ func (g *Sync) handleFlagSync(stream syncv1grpc.FlagSyncService_SyncFlagsClient,
 			Selector:           g.Selector,
 			IncrementalUpdates: g.IncrementalUpdates,
 		}
+		// Opening a stream alone does not prove that the source has caught up.
+		// Clear the disconnection only after a payload reaches the runtime.
+		g.disconnectedSince.Store(nil)
 
 		g.Logger.Debug("received full configuration payload")
 	}
