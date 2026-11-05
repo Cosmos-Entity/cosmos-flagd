@@ -10,6 +10,7 @@ import (
 	"net"
 	"strings"
 	stdsync "sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -774,6 +775,68 @@ func Test_SyncRetry(t *testing.T) {
 
 	if !sawStale {
 		t.Error("expected a stale notification to be emitted when the sync stream dropped")
+	}
+}
+
+// failFirstSyncFlagsClient fails its first SyncFlags call and delegates every later one.
+type failFirstSyncFlagsClient struct {
+	syncv1grpc.FlagSyncServiceClient
+	calls atomic.Int32
+}
+
+func (c *failFirstSyncFlagsClient) SyncFlags(
+	ctx context.Context, in *v1.SyncFlagsRequest, opts ...grpc.CallOption,
+) (syncv1grpc.FlagSyncService_SyncFlagsClient, error) {
+	if c.calls.Add(1) == 1 {
+		return nil, errors.New("connection reset by peer")
+	}
+	return c.FlagSyncServiceClient.SyncFlags(ctx, in, opts...)
+}
+
+// Test_SyncRetriesFailedInitialConnection validates that a failed first SyncFlags call is retried
+// rather than returned as an error, which would end flagd.
+func Test_SyncRetriesFailedInitialConnection(t *testing.T) {
+	bufListener := bufconn.Listen(1)
+	bServer := bufferedServer{listener: bufListener, mockResponses: []serverPayload{{flags: "{}"}}}
+	go serve(&bServer)
+
+	clientConn, err := grpc.NewClient("passthrough:///local",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return bufListener.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("error initiating the connection: %s", err.Error())
+	}
+
+	client := &failFirstSyncFlagsClient{FlagSyncServiceClient: syncv1grpc.NewFlagSyncServiceClient(clientConn)}
+	grpcSync := Sync{Logger: logger.NewLogger(nil, false), client: client}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	syncChan := make(chan sync.DataSync, 1)
+	errChan := make(chan error, 1)
+	go func() { errChan <- grpcSync.Sync(ctx, syncChan) }()
+
+	for {
+		select {
+		case err := <-errChan:
+			t.Fatalf("sync returned before delivering flags: %v", err)
+		case <-ctx.Done():
+			t.Fatal("timeout waiting for flags after a failed initial connection")
+		case data := <-syncChan:
+			if data.Stale {
+				continue
+			}
+			if data.FlagData != "{}" {
+				t.Errorf("expected flag data %q, but got %q", "{}", data.FlagData)
+			}
+			if got := client.calls.Load(); got < 2 {
+				t.Errorf("expected a retry after the failed first call, got %d call(s)", got)
+			}
+			return
+		}
 	}
 }
 
